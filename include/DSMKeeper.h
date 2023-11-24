@@ -90,6 +90,20 @@ public:
 
   ~DSMKeeper() { disconnectMemcached(); }
   void barrier(const std::string &barrierKey);
+  void set_barrier(const std::string &barrierKey) {
+    std::string key = std::string("barrier-") + barrierKey;
+    memSet(key.c_str(), key.size(), "0", 1);
+  }
+  void barrier(const std::string &barrierKey, int cs_num) {
+    std::string key = std::string("barrier-") + barrierKey;
+    memFetchAndAdd(key.c_str(), key.size());
+    while (true) {
+      uint64_t v = std::stoull(memGet(key.c_str(), key.size()));
+      if (v == cs_num) {
+        return;
+      }
+   }
+  }
   uint64_t sum(const std::string &sum_key, uint64_t value);
 };
 

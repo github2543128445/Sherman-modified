@@ -6,7 +6,11 @@
 #include <city.h>
 #include <functional>
 #include <iostream>
+#include "core/core_workload.h"
+#include "core/utils.h"
+#include "core/timer.h"
 
+#define CONFIG_ENABLE_CRC
 class IndexCache;
 
 struct LocalLockNode {
@@ -50,12 +54,12 @@ public:
               int coro_id = 0);
   void del(const Key &k, CoroContext *cxt = nullptr, int coro_id = 0);
 
-  uint64_t range_query(const Key &from, const Key &to, Value *buffer,
+  uint64_t range_query(const Key &from, const Key &to, int scan_len, Value *buffer,
                        CoroContext *cxt = nullptr, int coro_id = 0);
 
   void print_and_check_tree(CoroContext *cxt = nullptr, int coro_id = 0);
 
-  void run_coroutine(CoroFunc func, int id, int coro_cnt);
+  void run_coroutine(ycsbc::CoreWorkload *wl, int id, int total_ops, int coro_cnt);
 
   void lock_bench(const Key &k, CoroContext *cxt = nullptr, int coro_id = 0);
 
@@ -82,7 +86,7 @@ private:
   GlobalAddress get_root_ptr_ptr();
   GlobalAddress get_root_ptr(CoroContext *cxt, int coro_id);
 
-  void coro_worker(CoroYield &yield, RequstGen *gen, int coro_id);
+  void coro_worker(CoroYield &yield, ycsbc::CoreWorkload *wl, int total_ops, int coro_id);
   void coro_master(CoroYield &yield, int coro_cnt);
 
   void broadcast_new_root(GlobalAddress new_root_addr, int root_level);
@@ -125,6 +129,11 @@ private:
                           int coro_id);
   bool can_hand_over(GlobalAddress lock_addr);
   void releases_local_lock(GlobalAddress lock_addr);
+  Key str2key(std::string key) {
+      Key t_key;
+      memcpy(t_key.key, key.c_str(), sizeof(t_key));
+      return t_key;
+  }
 };
 
 class Header {
@@ -148,14 +157,22 @@ public:
     last_index = -1;
     lowest = kKeyMin;
     highest = kKeyMax;
+    for(int i = 0; i< KEY_SIZE; i++) {
+        lowest.key[i] = 0;
+    }
+    for(int i = 0; i< KEY_SIZE; i++) {
+        highest.key[i] = 'z';
+    }
   }
 
   void debug() const {
+    /*
     std::cout << "leftmost=" << leftmost_ptr << ", "
               << "sibling=" << sibling_ptr << ", "
               << "level=" << (int)level << ","
               << "cnt=" << last_index + 1 << ","
               << "range=[" << lowest << " - " << highest << "]";
+    */
   }
 } __attribute__((packed));
 ;
@@ -167,7 +184,7 @@ public:
 
   InternalEntry() {
     ptr = GlobalAddress::Null();
-    key = 0;
+    key = kNull;
   }
 } __attribute__((packed));
 
@@ -182,7 +199,7 @@ public:
     f_version = 0;
     r_version = 0;
     value = kValueNull;
-    key = 0;
+    key = kNull;
   }
 } __attribute__((packed));
 
@@ -307,8 +324,10 @@ public:
     front_version++;
     rear_version = front_version;
 #ifdef CONFIG_ENABLE_CRC
+    /*
     this->crc =
         CityHash32((char *)&front_version, (&rear_version) - (&front_version));
+    */
 #endif
   }
 
@@ -316,9 +335,11 @@ public:
 
     bool succ = true;
 #ifdef CONFIG_ENABLE_CRC
+    /*
     auto cal_crc =
         CityHash32((char *)&front_version, (&rear_version) - (&front_version));
     succ = cal_crc == this->crc;
+    */
 #endif
 
     succ = succ && (rear_version == front_version);

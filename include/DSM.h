@@ -10,6 +10,7 @@
 #include "GlobalAddress.h"
 #include "LocalAllocator.h"
 #include "RdmaBuffer.h"
+#include <mutex>
 
 class DSMKeeper;
 class Directory;
@@ -147,6 +148,8 @@ private:
   DSMConfig conf;
   std::atomic_int appID;
   Cache cache;
+  std::mutex alloc_lock;
+  uint64_t alloc_nodes;
 
   static thread_local int thread_id;
   static thread_local ThreadConnection *iCon;
@@ -168,6 +171,8 @@ private:
 public:
   bool is_register() { return thread_id != -1; }
   void barrier(const std::string &ss) { keeper->barrier(ss); }
+  void set_barrier(const std::string &ss) { keeper->set_barrier(ss); }
+  void barrier(const std::string &ss, int cs_num) { keeper->barrier(ss, cs_num); }
 
   char *get_rdma_buffer() { return rdma_buffer; }
   RdmaBuffer &get_rbuf(int coro_id) { return rbuf[coro_id]; }
@@ -196,9 +201,11 @@ public:
 };
 
 inline GlobalAddress DSM::alloc(size_t size) {
+  alloc_lock.lock();
 
   thread_local int next_target_node =
-      (getMyThreadID() + getMyNodeID()) % conf.machineNR;
+     // (getMyThreadID() + getMyNodeID()) % conf.machineNR;
+     alloc_nodes % MEMORY_NR;
   thread_local int next_target_dir_id =
       (getMyThreadID() + getMyNodeID()) % NR_DIRECTORY;
 
@@ -212,13 +219,16 @@ inline GlobalAddress DSM::alloc(size_t size) {
     local_allocator.set_chunck(rpc_wait()->addr);
 
     if (++next_target_dir_id == NR_DIRECTORY) {
-      next_target_node = (next_target_node + 1) % conf.machineNR;
+      // next_target_node = (next_target_node + 1) % conf.machineNR;
+      alloc_nodes = (alloc_nodes + 1) % MEMORY_NR;
+      next_target_node = alloc_nodes;
       next_target_dir_id = 0;
     }
 
     // retry
     addr = local_allocator.malloc(size, need_chunk);
   }
+  alloc_lock.unlock();
 
   return addr;
 }

@@ -40,7 +40,13 @@ Tree *tree;
 DSM *dsm;
 
 inline Key to_key(uint64_t k) {
-  return (CityHash64((char *)&k, sizeof(k)) + 1) % kKeySpace;
+  // return (CityHash64((char *)&k, sizeof(k)) + 1) % kKeySpace;
+    Key t_key;
+    k= (CityHash64((char *)&k, sizeof(k)) + 1) % kKeySpace;
+    std::string s_key = std::to_string(k);
+    s_key.resize(KEY_SIZE, '0');
+    memcpy(t_key.key, s_key.c_str(), KEY_SIZE);
+    return t_key;
 }
 
 class RequsetGenBench : public RequstGen {
@@ -140,11 +146,15 @@ void thread_run(int id) {
   while (true) {
 
     uint64_t dis = mehcached_zipf_next(&state);
-    uint64_t key = to_key(dis);
+    // uint64_t key = to_key(dis);
+    Key key = to_key(dis);
 
     Value v;
     timer.begin();
-
+    if (dsm->getMyNodeID() == 0) {
+      while (true)
+        ;
+    }
     if (rand_r(&seed) % 100 < kReadRatio) { // GET
       tree->search(key, v);
     } else {
@@ -232,6 +242,9 @@ int main(int argc, char *argv[]) {
 
   dsm->registerThread();
   tree = new Tree(dsm);
+  dsm->barrier("benchmark");
+  while(true) {  
+  }
 
   if (dsm->getMyNodeID() == 0) {
     for (uint64_t i = 1; i < 1024000; ++i) {

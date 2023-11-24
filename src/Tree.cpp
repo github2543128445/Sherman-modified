@@ -24,7 +24,11 @@ thread_local GlobalAddress path_stack[define::kMaxCoro]
 thread_local Timer timer;
 thread_local std::queue<uint16_t> hot_wait_queue;
 
+volatile bool need_stop = false;
+std::atomic<uint64_t> total_count;
+
 Tree::Tree(DSM *dsm, uint16_t tree_id) : dsm(dsm), tree_id(tree_id) {
+  total_count.store(0);
 
   for (int i = 0; i < dsm->getClusterSize(); ++i) {
     local_locks[i] = new LocalLockNode[define::kNumOfLock];
@@ -68,7 +72,7 @@ void Tree::print_verbose() {
     std::cerr << "format error" << std::endl;
   }
 
-  if (dsm->getMyNodeID() == 0) {
+  if (1) {
     std::cout << "Header size: " << sizeof(Header) << std::endl;
     std::cout << "Internal Page size: " << sizeof(InternalPage) << " ["
               << kInternalPageSize << "]" << std::endl;
@@ -458,7 +462,7 @@ next:
   }
 }
 
-uint64_t Tree::range_query(const Key &from, const Key &to, Value *value_buffer,
+uint64_t Tree::range_query(const Key &from, const Key &to, int scan_len, Value *value_buffer,
                            CoroContext *cxt, int coro_id) {
 
   const int kParaFetch = 32;
@@ -467,75 +471,76 @@ uint64_t Tree::range_query(const Key &from, const Key &to, Value *value_buffer,
 
   result.clear();
   leaves.clear();
-  index_cache->search_range_from_cache(from, to, result);
-  
-  // FIXME: here, we assume all innernal nodes are cached in compute node
-  if (result.empty()) {
-    return 0;
-  }
-
   uint64_t counter = 0;
-  for (auto page : result) {
-    auto cnt = page->hdr.last_index + 1;
-    auto addr = page->hdr.leftmost_ptr;
 
-    // [from, to]
-    // [lowest, page->records[0].key);
-    bool no_fetch = from > page->records[0].key || to < page->hdr.lowest;
-    if (!no_fetch) {
-      leaves.push_back(addr);
-    }
-    for (int i = 1; i < cnt; ++i) {
-      no_fetch = from > page->records[i].key || to < page->records[i - 1].key;
-      if (!no_fetch) {
-        leaves.push_back(page->records[i - 1].ptr);
-      }
-    }
-
-    no_fetch = from > page->hdr.highest || to < page->records[cnt - 1].key;
-    if (!no_fetch) {
-      leaves.push_back(page->records[cnt - 1].ptr);
-    }
-  }
-
-  int cq_cnt = 0;
-  char *range_buffer = (dsm->get_rbuf(coro_id)).get_range_buffer();
-  for (size_t i = 0; i < leaves.size(); ++i) {
-    if (i > 0 && i % kParaFetch == 0) {
-      dsm->poll_rdma_cq(kParaFetch);
-      cq_cnt -= kParaFetch;
-      for (int k = 0; k < kParaFetch; ++k) {
-        auto page = (LeafPage *)(range_buffer + k * kLeafPageSize);
-        for (int i = 0; i < kLeafCardinality; ++i) {
-          auto &r = page->records[i];
-          if (r.value != kValueNull && r.f_version == r.r_version) {
-            if (r.key >= from && r.key <= to) {
-              value_buffer[counter++] = r.value;
+  GlobalAddress addr = GlobalAddress::Null();
+  const CacheEntry *entry = nullptr;
+  entry = index_cache->search_from_cache(from, &addr);
+  if(entry == nullptr) {
+range_cache_miss:
+    // printf("range cache miss\n");
+    auto root = get_root_ptr(cxt, coro_id);
+    SearchResult result;
+    GlobalAddress p = root;
+    bool from_cache = false;
+    while(page_search(p, from, result, cxt, coro_id, from_cache)) {
+        if(result.slibing != GlobalAddress::Null()) {
+            p = result.slibing;
+        } else {
+            p = result.next_level;
+            if(result.level == 1) {
+                addr = result.next_level;
+                break;
             }
-          }
         }
-      }
     }
-    dsm->read(range_buffer + kLeafPageSize * (i % kParaFetch), leaves[i],
-              kLeafPageSize, true);
-    cq_cnt++;
   }
 
-  if (cq_cnt != 0) {
-    dsm->poll_rdma_cq(cq_cnt);
-    for (int k = 0; k < cq_cnt; ++k) {
-      auto page = (LeafPage *)(range_buffer + k * kLeafPageSize);
-      for (int i = 0; i < kLeafCardinality; ++i) {
+  std::vector<std::pair<KeyType, Value>> kv_results;
+  int len = scan_len;
+  char *range_buffer = (dsm->get_rbuf(coro_id)).get_range_buffer();
+
+  bool inited = false;
+  while(len > 0) {
+    dsm->read_sync(range_buffer, addr, kLeafPageSize);
+    auto page = (LeafPage *)(range_buffer);
+    // printf("%32s %32s %32s\n", from.key, page->hdr.lowest.key, page->hdr.highest.key);
+    if(inited == false) {
+        if(page->hdr.lowest > from || page->hdr.highest < from){
+            inited = true;
+            goto range_cache_miss;
+        }
+        assert(page->hdr.lowest <= from && page->hdr.highest >= from);
+    }
+    inited = true;
+    for (int i = 0; i < kLeafCardinality; ++i) {
         auto &r = page->records[i];
         if (r.value != kValueNull && r.f_version == r.r_version) {
-          if (r.key >= from && r.key <= to) {
-            value_buffer[counter++] = r.value;
-          }
+            if (r.key >= from) {
+                uint64_t value_addr = r.value;
+                std::pair<KeyType, Value> tmp(r.key, value_addr);
+                kv_results.push_back(tmp);
+                counter++;
+                // value_buffer[counter] = r.value;
+                len --;
+            }
         }
-      }
     }
+    if(page->hdr.sibling_ptr == GlobalAddress::Null()) { 
+        printf("%31s %31s %31s\n", from.key, page->hdr.lowest.key, page->hdr.highest.key);
+        break; 
+    }
+    addr = page->hdr.sibling_ptr;
   }
+  // printf("____________________\n");
 
+  if(counter > scan_len) counter = scan_len;
+  std::sort(kv_results.begin(), kv_results.end(), kv_cmp());
+
+  if(counter < scan_len) {
+    printf("less than len %ld\n", counter);
+  }
+  // printf("counter %d\n", counter);
   return counter;
 }
 
@@ -944,7 +949,7 @@ bool Tree::leaf_page_store(GlobalAddress page_addr, const Key &k,
     for (int i = m; i < cnt; ++i) { // move
       sibling->records[i - m].key = page->records[i].key;
       sibling->records[i - m].value = page->records[i].value;
-      page->records[i].key = 0;
+      page->records[i].key = kNull;
       page->records[i].value = kValueNull;
     }
     page->hdr.last_index -= (cnt - m);
@@ -1056,14 +1061,14 @@ bool Tree::leaf_page_del(GlobalAddress page_addr, const Key &k, int level,
   return true;
 }
 
-void Tree::run_coroutine(CoroFunc func, int id, int coro_cnt) {
+void Tree::run_coroutine(ycsbc::CoreWorkload *wl, int id, int total_ops, int coro_cnt) {
 
   using namespace std::placeholders;
 
   assert(coro_cnt <= define::kMaxCoro);
   for (int i = 0; i < coro_cnt; ++i) {
-    auto gen = func(i, dsm, id);
-    worker[i] = CoroCall(std::bind(&Tree::coro_worker, this, _1, gen, i));
+    // auto gen = func(i, dsm, id);
+    worker[i] = CoroCall(std::bind(&Tree::coro_worker, this, _1, wl, total_ops,  i));
   }
 
   master = CoroCall(std::bind(&Tree::coro_master, this, _1, coro_cnt));
@@ -1071,7 +1076,7 @@ void Tree::run_coroutine(CoroFunc func, int id, int coro_cnt) {
   master();
 }
 
-void Tree::coro_worker(CoroYield &yield, RequstGen *gen, int coro_id) {
+void Tree::coro_worker(CoroYield &yield, ycsbc::CoreWorkload *wl, int total_ops, int coro_id) {
   CoroContext ctx;
   ctx.coro_id = coro_id;
   ctx.master = &master;
@@ -1079,23 +1084,51 @@ void Tree::coro_worker(CoroYield &yield, RequstGen *gen, int coro_id) {
 
   Timer coro_timer;
   auto thread_id = dsm->getMyThreadID();
-
-  while (true) {
-
-    auto r = gen->next();
-
-    coro_timer.begin();
-    if (r.is_search) {
-      Value v;
-      this->search(r.k, v, &ctx, coro_id);
-    } else {
-      this->insert(r.k, r.v, &ctx, coro_id);
-    }
-    auto us_10 = coro_timer.end() / 100;
-    if (us_10 >= LATENCY_WINDOWS) {
-      us_10 = LATENCY_WINDOWS - 1;
-    }
-    latency[thread_id][us_10]++;
+	while(!need_stop) {
+        switch (wl->NextOperation()) {
+        case ycsbc::READ: {
+            const std::string &key = wl->NextTransactionKey();
+            Value value;
+            search(str2key(key), value, &ctx, coro_id);
+            break;
+        }
+        case ycsbc::UPDATE: {
+            const std::string &key = wl->NextTransactionKey();
+            Value value = 12;
+            insert(str2key(key), value, &ctx, coro_id);
+            break;
+        }
+        case ycsbc::INSERT: {
+            const std::string &key = wl->NextSequenceKey();
+            Value value = 12;
+            insert(str2key(key), value, &ctx, coro_id);
+            break;
+        }
+        case ycsbc::SCAN: {
+            std::string from;
+            std::string to;
+            int len = wl->NextScanLength();
+            if(len == 0) {
+                len = 1;
+            }
+            wl->NextTransactionKeyRange(len, from, to);
+            Value values[1000];
+            range_query(str2key(from), str2key(to), len, values, &ctx, coro_id);
+            break;
+        }
+        case ycsbc::READMODIFYWRITE: {
+            const std::string &key = wl->NextTransactionKey();
+            Value value;
+            search(str2key(key), value, &ctx, coro_id);
+            insert(str2key(key), value, &ctx, coro_id);
+            break;
+        }
+        default:
+        throw utils::Exception("Operation request is not recognized!");
+        }
+        if(total_count++ > total_ops) {
+            need_stop = true;
+        }
   }
 }
 
@@ -1174,7 +1207,18 @@ inline void Tree::releases_local_lock(GlobalAddress lock_addr) {
 
 void Tree::index_cache_statistics() {
   index_cache->statistics();
-  index_cache->bench();
+  // index_cache->bench();
+  uint64_t cache_hit_count = 0;
+  uint64_t cache_miss_count = 0;
+  for (int i = 0; i < MAX_APP_THREAD; ++i) {
+    cache_hit_count += cache_hit[i][0];
+    cache_miss_count += cache_miss[i][0];
+  }
+  std::cout<<"Cache Hit Count: "<<cache_hit_count<<\
+  ", Ratio: "<<(double)((double)cache_hit_count / (double)(cache_hit_count + cache_miss_count))<<std::endl;
+
+  std::cout<<"Cache Miss Count: "<<cache_miss_count<<\
+  ", Ratio: "<<(double)((double)cache_miss_count / (double)(cache_hit_count + cache_miss_count))<<std::endl;
 }
 
 void Tree::clear_statistics() {

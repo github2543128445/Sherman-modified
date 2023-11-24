@@ -16,6 +16,9 @@
 
 #include "WRLock.h"
 
+#define KEY_SIZE 24
+#define VALUE_SIZE 8
+#define MEMORY_NR 3
 // CONFIG_ENABLE_EMBEDDING_LOCK and CONFIG_ENABLE_CRC
 // **cannot** be ON at the same time
 
@@ -38,7 +41,7 @@
 #define RAW_RECV_CQ_COUNT 128
 
 // { app thread
-#define MAX_APP_THREAD 26
+#define MAX_APP_THREAD 80
 
 #define APP_MESSAGE_NR 96
 
@@ -85,7 +88,7 @@ static_assert(kRootPointerStoreOffest % sizeof(uint64_t) == 0, "XX");
 
 // lock on-chip memory
 constexpr uint64_t kLockStartAddr = 0;
-constexpr uint64_t kLockChipMemSize = 256 * 1024;
+constexpr uint64_t kLockChipMemSize = 128 * 1024;
 
 // number of locks
 // we do not use 16-bit locks, since 64-bit locks can provide enough concurrency.
@@ -93,14 +96,14 @@ constexpr uint64_t kLockChipMemSize = 256 * 1024;
 constexpr uint64_t kNumOfLock = kLockChipMemSize / sizeof(uint64_t);
 
 // level of tree
-constexpr uint64_t kMaxLevelOfTree = 7;
+constexpr uint64_t kMaxLevelOfTree = 27;
 
 constexpr uint16_t kMaxCoro = 8;
 constexpr int64_t kPerCoroRdmaBuf = 128 * 1024;
 
 constexpr uint8_t kMaxHandOverTime = 8;
 
-constexpr int kIndexCacheSize = 1000; // MB
+constexpr int kIndexCacheSize = 450 * 0.10; // MB
 } // namespace define
 
 static inline unsigned long long asm_rdtsc(void) {
@@ -109,16 +112,80 @@ static inline unsigned long long asm_rdtsc(void) {
   return ((unsigned long long)lo) | (((unsigned long long)hi) << 32);
 }
 
+// KeyType
+struct KeyType {
+    char key[KEY_SIZE];
+    __inline__ void operator=(const KeyType &a) {
+        memcpy(key, a.key, KEY_SIZE);
+    }
+	void operator=(const char* a) { memcpy(this->key, a, KEY_SIZE); }
+};
+
+__inline__  bool operator<(const KeyType &a, const KeyType &b) {
+    return (memcmp(a.key, b.key, KEY_SIZE) < 0);
+}
+__inline__  bool operator>(const KeyType &a, const KeyType &b) {
+    return (memcmp(a.key, b.key, KEY_SIZE) > 0);
+}
+__inline__  bool operator==(const KeyType &a, const KeyType &b) {
+    return (memcmp(a.key, b.key, KEY_SIZE) == 0);
+}
+__inline__  bool operator>=(const KeyType &a, const KeyType &b) {
+    return (memcmp(a.key, b.key, KEY_SIZE) >= 0);
+}
+__inline__  bool operator<=(const KeyType &a, const KeyType &b) {
+    return (memcmp(a.key, b.key, KEY_SIZE) <= 0);
+}
+__inline__  bool operator!=(const KeyType &a, const KeyType &b) {
+    return (memcmp(a.key, b.key, KEY_SIZE) != 0);
+}
+__inline__  KeyType operator-(KeyType a, const int &b) {
+    a.key[KEY_SIZE - 1] = a.key[KEY_SIZE - 1] - b;
+    return a;
+}
+__inline__  KeyType operator+(KeyType a, const int &b) {
+    a.key[KEY_SIZE - 1] = a.key[KEY_SIZE - 1] + b;
+    return a;
+}
+__inline__ void operator<<(std::ostream &os, const KeyType &a) {
+    os<<a.key;
+}
+
 // For Tree
-using Key = uint64_t;
+using Key = KeyType;
 using Value = uint64_t;
 constexpr Key kKeyMin = std::numeric_limits<Key>::min();
 constexpr Key kKeyMax = std::numeric_limits<Key>::max();
+constexpr Key kNull = {0};
 constexpr Value kValueNull = 0;
 
+struct kv_cmp {
+    bool operator()(const std::pair<KeyType, Value>& a, const std::pair<KeyType, Value>& b) {
+        if(memcmp(a.first.key, b.first.key, KEY_SIZE) < 0) {
+            return true;
+        }
+        return false;
+    }
+};
 // Note: our RNICs can read 1KB data in increasing address order (but not for 4KB)
-constexpr uint32_t kInternalPageSize = 1024;
-constexpr uint32_t kLeafPageSize = 1024;
+constexpr uint32_t kInternalPageSize = 1120;
+constexpr uint32_t kLeafPageSize = 1166;
+// constexpr uint32_t kInternalPageSize = 1120/16 + 90;
+// constexpr uint32_t kLeafPageSize = 1166/16 + 95;
+// constexpr uint32_t kInternalPageSize = 1120/8 + 80;
+// constexpr uint32_t kLeafPageSize = 1166/8 + 85;
+// constexpr uint32_t kInternalPageSize = 1120/4 + 75;
+// constexpr uint32_t kLeafPageSize = 1166/4 + 80;
+// constexpr uint32_t kInternalPageSize = 1120/2 + 50;
+// constexpr uint32_t kLeafPageSize = 1166/2 + 60;
+// constexpr uint32_t kInternalPageSize = 1120 * 1.91;
+// constexpr uint32_t kLeafPageSize = 1166 * 1.95;
+// constexpr uint32_t kInternalPageSize = 1120 * 3.74;
+// constexpr uint32_t kLeafPageSize = 1166 * 3.82;
+// constexpr uint32_t kInternalPageSize = 1120 * 7.41;
+// constexpr uint32_t kLeafPageSize = 1166 * 7.56;
+// constexpr uint32_t kInternalPageSize = 1120 * 14.72;
+// constexpr uint32_t kLeafPageSize = 1166 * 15.02;
 
 __inline__ unsigned long long rdtsc(void) {
   unsigned hi, lo;

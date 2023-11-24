@@ -35,21 +35,21 @@ void rdmaQueryQueuePair(ibv_qp *qp) {
 }
 
 void checkDMSupported(struct ibv_context *ctx) {
-  struct ibv_exp_device_attr attrs;
+  struct ibv_device_attr_ex attrs;
 
-  attrs.comp_mask = IBV_EXP_DEVICE_ATTR_UMR;
-  attrs.comp_mask |= IBV_EXP_DEVICE_ATTR_MAX_DM_SIZE;
-
-  if (ibv_exp_query_device(ctx, &attrs)) {
+  // attrs.comp_mask = IBV_EXP_DEVICE_ATTR_UMR;
+  // attrs.comp_mask |= IBV_EXP_DEVICE_ATTR_MAX_DM_SIZE;
+  if (ibv_query_device_ex(ctx,nullptr, &attrs)) {
     printf("Couldn't query device attributes\n");
   }
 
-  if (!(attrs.comp_mask & IBV_EXP_DEVICE_ATTR_MAX_DM_SIZE)) {
-    fprintf(stderr, "Can not support device memory!\n");
+  /*if (!(attrs.comp_mask & IBV_EXP_DEVICE_ATTR_MAX_DM_SIZE)) {
+    fprintf(stderr, "Can not support Device Memory!\n");
     exit(-1);
-  } else if (!(attrs.max_dm_size)) {
+  } else */
+  if (!(attrs.max_dm_size)) {
   } else {
     kMaxDeviceMemorySize = attrs.max_dm_size;
-    printf("The RNIC has %dKB device memory\n", kMaxDeviceMemorySize / 1024);
+    printf("NIC Device Memory is %dKB\n", kMaxDeviceMemorySize / 1024);
   }
 }

@@ -14,7 +14,7 @@ struct CacheEntry {
 static_assert(sizeof(CacheEntry) == 2 * sizeof(Key) + sizeof(uint64_t), "XXX");
 
 inline std::ostream &operator<<(std::ostream &os, const CacheEntry &obj) {
-  os << "[" << (int)obj.from << ", " << obj.to + 1 << ")";
+  // os << "[" << (int)obj.from << ", " << obj.to + 1 << ")";
   return os;
 }
 
@@ -25,7 +25,7 @@ struct CacheEntryComparator {
 
   static DecodedType decode_key(const char *b) { return Decode(b); }
 
-  int cmp(const DecodedType a_v, const DecodedType b_v) const {
+  int cmp(const DecodedType &a_v, const DecodedType &b_v) const {
     if (a_v.to < b_v.to) {
       return -1;
     }
@@ -47,7 +47,7 @@ struct CacheEntryComparator {
     return cmp(Decode(a), Decode(b));
   }
 
-  int operator()(const char *a, const DecodedType b) const {
+  int operator()(const char *a, const DecodedType &b) const {
     return cmp(Decode(a), b);
   }
 };

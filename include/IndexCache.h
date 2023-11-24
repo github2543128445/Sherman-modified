@@ -6,6 +6,7 @@
 #include "Timer.h"
 #include "WRLock.h"
 #include "third_party/inlineskiplist.h"
+#include "third_party/lockfree_queue.h"
 
 #include <atomic>
 #include <queue>
@@ -45,7 +46,8 @@ private:
   std::atomic<int64_t> skiplist_node_cnt;
   int64_t all_page_cnt;
 
-  std::queue<std::pair<void *, uint64_t>> delay_free_list;
+  LockFreeQueue<InternalPage *> cache_pool_list;
+  void* cache_buffer;
   WRLock free_lock;
 
   // SkipList
@@ -59,8 +61,13 @@ private:
 inline IndexCache::IndexCache(int cache_size) : cache_size(cache_size) {
   skiplist = new CacheSkipList(cmp, &alloc, 21);
   uint64_t memory_size = define::MB * cache_size;
+  cache_buffer = hugePageAlloc(memory_size);
+  printf("Cache %d MB\n", cache_size);
 
-  all_page_cnt = memory_size / sizeof(InternalPage);
+  all_page_cnt = memory_size / kInternalPageSize;
+  for(uint64_t i = 0; i < all_page_cnt; i++) {
+    cache_pool_list.push((InternalPage *)(cache_buffer + uint64_t(i * kInternalPageSize)));
+  }
   free_page_cnt.store(all_page_cnt);
   skiplist_node_cnt.store(0);
 }
@@ -100,7 +107,11 @@ inline const CacheEntry *IndexCache::find_entry(const Key &k) {
 }
 
 inline bool IndexCache::add_to_cache(InternalPage *page) {
-  auto new_page = (InternalPage *)malloc(kInternalPageSize);
+  InternalPage* new_page;
+  while(cache_pool_list.pop(new_page) == false) {
+    evict_one();
+  }
+
   memcpy(new_page, page, kInternalPageSize);
   new_page->index_cache_freq = 0;
 
@@ -126,7 +137,7 @@ inline bool IndexCache::add_to_cache(InternalPage *page) {
       }
     }
 
-    free(new_page);
+    cache_pool_list.push(new_page);
     return false;
   }
 }
@@ -134,20 +145,6 @@ inline bool IndexCache::add_to_cache(InternalPage *page) {
 inline const CacheEntry *IndexCache::search_from_cache(const Key &k,
                                                        GlobalAddress *addr,
                                                        bool is_leader) {
-  // notice: please ensure the thread 0 can make progress
-  if (is_leader &&
-      !delay_free_list.empty()) { // try to free a page in the delay-free-list
-    auto p = delay_free_list.front();
-    if (asm_rdtsc() - p.second > 3000ull * 10) {
-      free(p.first);
-      free_page_cnt.fetch_add(1);
-
-      free_lock.wLock();
-      delay_free_list.pop();
-      free_lock.wUnlock();
-    }
-  }
-
   auto entry = find_entry(k);
 
   InternalPage *page = entry ? entry->ptr : nullptr;
@@ -215,9 +212,8 @@ inline bool IndexCache::invalidate(const CacheEntry *entry) {
 
   if (__sync_bool_compare_and_swap(&(entry->ptr), ptr, 0)) {
 
-    free_lock.wLock();
-    delay_free_list.push(std::make_pair(ptr, asm_rdtsc()));
-    free_lock.wUnlock();
+    cache_pool_list.push(ptr);
+    free_page_cnt.fetch_add(1);
     return true;
   }
 
@@ -228,7 +224,9 @@ inline const CacheEntry *IndexCache::get_a_random_entry(uint64_t &freq) {
   uint32_t seed = asm_rdtsc();
   GlobalAddress tmp_addr;
 retry:
-  auto k = rand_r(&seed) % (1000ull * define::MB);
+  auto evict_id = rand_r(&seed) % all_page_cnt;
+  auto cache_ptr = (InternalPage *)(cache_buffer + evict_id * kInternalPageSize);
+  auto k = cache_ptr->hdr.lowest;
   auto e = this->search_from_cache(k, &tmp_addr);
   if (!e) {
     goto retry;
@@ -246,21 +244,29 @@ retry:
 }
 
 inline void IndexCache::evict_one() {
-
+re_evict:
   uint64_t freq1, freq2;
   auto e1 = get_a_random_entry(freq1);
   auto e2 = get_a_random_entry(freq2);
-
+  
+  bool finish_evict = false;
   if (freq1 < freq2) {
-    invalidate(e1);
+    finish_evict = invalidate(e1);
   } else {
-    invalidate(e2);
+    finish_evict = invalidate(e2);
+  }
+  if(finish_evict == false) {
+    goto re_evict;
   }
 }
 
 inline void IndexCache::statistics() {
-  printf("[skiplist node: %ld]  [page cache: %ld]\n", skiplist_node_cnt.load(),
-         all_page_cnt - free_page_cnt.load());
+  printf("[skiplist node: %ld]  [page cache: %ld, size: %ld] [all cache: %ld, size: %ld]\n", 
+                    skiplist_node_cnt.load(),
+        all_page_cnt - free_page_cnt.load(), 
+        (all_page_cnt - free_page_cnt.load()) * kInternalPageSize,
+        all_page_cnt, 
+        (all_page_cnt) * kInternalPageSize);
 }
 
 inline void IndexCache::bench() {
@@ -271,7 +277,6 @@ inline void IndexCache::bench() {
 
   for (int i = 0; i < loop; ++i) {
     uint64_t r = rand() % (5 * define::MB);
-    this->find_entry(r);
   }
 
   t.end_print(loop);
