@@ -242,9 +242,9 @@ int main(int argc, char *argv[]) {
 
   dsm->registerThread();
   tree = new Tree(dsm);
-  // dsm->barrier("benchmark");
-  // while(true) {  
-  // }
+  dsm->barrier("benchmark");
+  while(true) {  
+  }
 
   if (dsm->getMyNodeID() == 0) {
     for (uint64_t i = 1; i < 1024000; ++i) {
